@@ -138,6 +138,20 @@ def _validate_generated_response(system_name: str, response: str) -> str:
         raise RuntimeError(f"{system_name} generation failed: {cleaned}")
     return cleaned
 
+_ARM_CITATION_TAG = re.compile(r"\[(?:Evidence|Context)(\s*\d[\d,\s\-–]*)\]")
+
+def _blind_citation_tags(response: str) -> str:
+    """Rewrite arm-specific citation tags to the judge's neutral [Doc i] tags.
+
+    Vanilla answers cite [Context i] and HCAD answers cite [Evidence i]; the
+    judge sees both evidence blocks tagged [Doc i]. Left as-is, the tag word
+    reveals which system wrote an answer (unblinding the pairwise judge) and
+    makes citations harder to match to evidence. Indices are unchanged, so
+    [Doc i] still points at the same item. Applied only to judge inputs;
+    citation precision is computed on the raw response.
+    """
+    return _ARM_CITATION_TAG.sub(r"[Doc\1]", response)
+
 def _format_retrieved_evidence(contexts: List[Dict[str, Any]], tag: str) -> str:
     """Expose answer-specific retrieval evidence to the judge with a word cap."""
     if not contexts:
@@ -731,15 +745,21 @@ def run_benchmark(num_samples: int = 10, output_path: Optional[Path] = None,
         hcad_evidence = _format_retrieved_evidence(hcad_contexts, "Doc")  # neutral tags
         logger.info("  HCAD-RAG response (%d chars): %.120s...", len(resp_hcad), resp_hcad)
 
+        # Judge inputs use neutral [Doc i] citation tags for every arm (blind
+        # judging); the raw responses are kept for citation precision below.
+        judge_baseline = _blind_citation_tags(resp_baseline)
+        judge_vanilla = _blind_citation_tags(resp_vanilla)
+        judge_hcad = _blind_citation_tags(resp_hcad)
+
         # 2. Scoring-Based Assessment (0-100)
         score_base = evaluator.evaluate_scoring(
-            q, resp_baseline, ref, fallback_on_error=True
+            q, judge_baseline, ref, fallback_on_error=True
         )
         score_van = evaluator.evaluate_scoring(
-            q, resp_vanilla, ref, answer_evidence=vanilla_evidence, fallback_on_error=True
+            q, judge_vanilla, ref, answer_evidence=vanilla_evidence, fallback_on_error=True
         )
         score_hcad = evaluator.evaluate_scoring(
-            q, resp_hcad, ref, answer_evidence=hcad_evidence, fallback_on_error=True
+            q, judge_hcad, ref, answer_evidence=hcad_evidence, fallback_on_error=True
         )
         logger.info("  Scores - Baseline: %.1f, Vanilla: %.1f, HCAD: %.1f",
                      score_base.overall_score, score_van.overall_score, score_hcad.overall_score)
@@ -772,14 +792,14 @@ def run_benchmark(num_samples: int = 10, output_path: Optional[Path] = None,
         # 3. Selection-Based Assessment (with order counterbalancing)
         # Run AB order
         sel_van_ab = evaluator.evaluate_selection(
-            q, resp_hcad, resp_vanilla, ref,
+            q, judge_hcad, judge_vanilla, ref,
             label_a="HCAD-RAG", label_b="Vanilla RAG",
             evidence_a=hcad_evidence, evidence_b=vanilla_evidence,
             fallback_on_error=True,
         )
         # Run BA order (swap answers)
         sel_van_ba = evaluator.evaluate_selection(
-            q, resp_vanilla, resp_hcad, ref,
+            q, judge_vanilla, judge_hcad, ref,
             label_a="Vanilla RAG", label_b="HCAD-RAG",
             evidence_a=vanilla_evidence, evidence_b=hcad_evidence,
             fallback_on_error=True,
@@ -788,13 +808,13 @@ def run_benchmark(num_samples: int = 10, output_path: Optional[Path] = None,
         sel_van = _merge_selection_results(sel_van_ab, sel_van_ba, "HCAD-RAG")
 
         sel_base_ab = evaluator.evaluate_selection(
-            q, resp_hcad, resp_baseline, ref,
+            q, judge_hcad, judge_baseline, ref,
             label_a="HCAD-RAG", label_b="Baseline LLM",
             evidence_a=hcad_evidence,
             fallback_on_error=True,
         )
         sel_base_ba = evaluator.evaluate_selection(
-            q, resp_baseline, resp_hcad, ref,
+            q, judge_baseline, judge_hcad, ref,
             label_a="Baseline LLM", label_b="HCAD-RAG",
             evidence_b=hcad_evidence,
             fallback_on_error=True,
@@ -805,13 +825,13 @@ def run_benchmark(num_samples: int = 10, output_path: Optional[Path] = None,
         # comparison - add the vanilla-vs-baseline pair (2 extra judge calls
         # per question) so the win-rate matrix covers all three pairings.
         sel_vb_ab = evaluator.evaluate_selection(
-            q, resp_vanilla, resp_baseline, ref,
+            q, judge_vanilla, judge_baseline, ref,
             label_a="Vanilla RAG", label_b="Baseline LLM",
             evidence_a=vanilla_evidence,
             fallback_on_error=True,
         )
         sel_vb_ba = evaluator.evaluate_selection(
-            q, resp_baseline, resp_vanilla, ref,
+            q, judge_baseline, judge_vanilla, ref,
             label_a="Baseline LLM", label_b="Vanilla RAG",
             evidence_b=vanilla_evidence,
             fallback_on_error=True,

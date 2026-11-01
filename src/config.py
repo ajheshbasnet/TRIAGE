@@ -355,6 +355,15 @@ Clearly cite specific evidence from the context where applicable, and supplement
 with established medical knowledge when the context is incomplete.
 Be precise, thorough, and clinically rigorous."""
 
+# System prompt for any arm answering WITHOUT retrieved evidence: the
+# no-retrieval baseline and HCAD-RAG when its gate abstains. Shared so both
+# no-evidence cases are prompted identically.
+NO_CONTEXT_SYSTEM_PROMPT = (
+    "You are a biomedical research assistant specializing in clinical medicine. "
+    "Use your expert clinical domain knowledge to deliver comprehensive, accurate, "
+    "and actionable answers. Be precise, thorough, and clinically rigorous."
+)
+
 # Vector Database
 CHROMA_COLLECTION_NAME = "biomedical_contexts"
 CHROMA_DISTANCE_METRIC = "cosine"

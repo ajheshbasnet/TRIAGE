@@ -1,6 +1,6 @@
 from typing import Any, Dict, Optional
 
-from src.config import FEW_SHOT_COUNT, LLM_SYSTEM_PROMPT
+from src.config import FEW_SHOT_COUNT, LLM_SYSTEM_PROMPT, NO_CONTEXT_SYSTEM_PROMPT
 
 
 def context_document(context: Dict[str, Any]) -> str:
@@ -191,6 +191,11 @@ class PromptBuilder:
         prompted than the no-retrieval arm.
         """
         context_block = self.format_contexts_block(contexts)
+        if not contexts and system_prompt is None:
+            # Abstention: the context-oriented system prompt ("use the
+            # provided context...") would contradict the empty evidence
+            # block; use the exact no-evidence prompt the baseline gets.
+            system_prompt = NO_CONTEXT_SYSTEM_PROMPT
 
         user_content = (
             f"Clinical Query:\n{query}\n\n"

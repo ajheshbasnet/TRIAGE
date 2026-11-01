@@ -189,7 +189,14 @@ class DecisionGate:
                 remaining_words -= len(words)
             elif idx == 0 and words:
                 # clip the top candidate at the budget instead of dropping it
-                bounded.append({**candidate, "document": " ".join(words[: self.token_budget_words])})
+                # Clip at the last sentence boundary inside the budget (same
+                # rule as the vanilla arm and the judge-side formatter):
+                # mid-sentence cuts can sever negations and qualifiers.
+                budget_text = " ".join(words[: self.token_budget_words])
+                cut = max(budget_text.rfind(". "), budget_text.rfind("! "),
+                          budget_text.rfind("? "))
+                clipped = budget_text if cut == -1 else budget_text[: cut + 1]
+                bounded.append({**candidate, "document": clipped.strip()})
                 remaining_words = 0
         verified = bounded
 

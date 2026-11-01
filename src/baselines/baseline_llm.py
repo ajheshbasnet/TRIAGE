@@ -4,7 +4,7 @@ from typing import Optional
 
 import requests
 
-from src.config import LLM_MODEL, LLM_TEMPERATURE, LLM_MAX_TOKENS
+from src.config import LLM_MODEL, LLM_TEMPERATURE, LLM_MAX_TOKENS, NO_CONTEXT_SYSTEM_PROMPT
 
 logger = logging.getLogger(__name__)
 
@@ -12,12 +12,9 @@ logger = logging.getLogger(__name__)
 OLLAMA_BASE_URL = "http://localhost:11434"
 OLLAMA_GENERATE_ENDPOINT = f"{OLLAMA_BASE_URL}/api/generate"
 
-# System prompt for the standalone baseline - matches HCAD-RAG structure
-BASELINE_SYSTEM_PROMPT = (
-    "You are a biomedical research assistant specializing in clinical medicine. "
-    "Use your expert clinical domain knowledge to deliver comprehensive, accurate, "
-    "and actionable answers. Be precise, thorough, and clinically rigorous."
-)
+# System prompt for the standalone baseline - identical to HCAD-RAG's
+# abstention (no-evidence) prompt.
+BASELINE_SYSTEM_PROMPT = NO_CONTEXT_SYSTEM_PROMPT
 
 def _extract_answer_letter(response: str) -> str:
     """Robustly extract a single answer letter (A/B/C/D) from varied LLM outputs.
