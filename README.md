@@ -8,7 +8,7 @@ A novel Retrieval-Augmented Generation framework that decomposes clinical semant
 ## Key Innovations
 
 1. **Semantic Decoupling**: Represents each medical statement as a 3×d matrix $X_{\text{HCAD}} = [E; R; M]$ instead of a flat 1×d vector, decoupling entities, predicates, and modifiers.
-2. **Anisotropic Transformation**: Computes a topology-aware transformation matrix $W_A$ to weight clinical embedding dimensions based on knowledge graph properties (node degree, relation confidence, IDF).
+2. **Hybrid Decoupled Scoring**: Ranks candidates by $\Phi = w_d \cdot \cos(q, c) + (1 - w_d) \cdot \Phi_{\text{struct}}$, fusing the full-text dense match with the presence-masked Entity/Relation/Modifier channel score. The legacy topology-block weighting $W_A$ (node degree, edge confidence, IDF) remains available as an ablation (`HCAD_ANISO_DIM_WEIGHTING=1`); a query-adaptive channel-weight adapter can be trained on the dev pool (`train-tensor`, `HCAD_TENSOR_MODE=learned`).
 3. **Adaptive Heaviside Filtering**: Replaces rigid Top-K retrieval with a dual-gated dynamic threshold:
    $$\mathcal{M}_{\text{HCAD}}(t_i) = \Theta(\Phi_{\text{Final}}(t_i) - (\mu + k\sigma))$$
 4. **JEV System One Decision Gate**: Employs an intelligent decision gate (`typesafe-sdk`) to evaluate factual groundedness and prune irrelevant or ungrounded context before prompt assembly, preventing token bloat and hallucination injection.
@@ -142,6 +142,24 @@ values; retrieval and model architecture are unchanged.
 (pay-per-token, needs HF billing; roughly $2 for a 50-sample run) while all
 generation stays free and local. `JUDGE_PROVIDER=nvidia` does the same via
 NVIDIA NIM. Without the variable, the judge follows `LLM_PROVIDER`.
+
+### Retrieval scoring knobs (ablations)
+
+| Variable | Default | Effect |
+|----------|---------|--------|
+| `HCAD_DENSE_WEIGHT` | `0.5` | Weight of the dense full-text cosine in Φ; `0` = legacy structure-only score |
+| `HCAD_ANISO_DIM_WEIGHTING` | `0` | `1` re-enables the legacy topology block weighting of embedding dimensions |
+| `HCAD_PRESENCE_MASKING` | `1` | Query-conditioned channel-presence masking |
+| `HCAD_RELATION_VOCAB` | `1` | PrimeKG relation labels / query relations mapped to canonical verb phrases |
+| `HCAD_EXPANSION_RULE` | `soft` | Member order inside relation hyperedges: `desc`, `soft`, `asc_cap` |
+| `HCAD_TAU_SAT` | unset | Gate-2 saturation ceiling, calibrated by `retrieval-eval` on the dev pool |
+
+`python src/main.py retrieval-eval --pool dev` reports paired Recall@5/NDCG@5
+for the legacy baseline, each added change, and the full configuration.
+
+All three benchmark arms (Baseline LLM, Vanilla RAG, HCAD-RAG) receive the
+same answer-synthesis instructions (`synthesis_instructions` in
+`src/core/prompt_builder.py`); they differ only in the evidence supplied.
 
 ---
 

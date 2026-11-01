@@ -15,6 +15,83 @@ def context_document(context: Dict[str, Any]) -> str:
     return str(document)
 
 
+_SYNTHESIS_COVERAGE = (
+    "Cover the relevant pathophysiology, first- and second-line management, "
+    "contraindications and safety considerations, monitoring, differential "
+    "diagnosis, and complications when the question calls for them; omit "
+    "tangential details. Avoid speculation and unsupported patient-specific "
+    "recommendations."
+)
+
+_SYNTHESIS_LENGTH = (
+    "IMPORTANT: Keep your response focused and concise (under 800 words total). "
+    "Prioritize clinical precision over exhaustive enumeration. Avoid repeating "
+    "the same point across sections."
+)
+
+_SYNTHESIS_STRUCTURE = (
+    "Structure your response clearly with the following sections:\n"
+    "1. Executive Clinical Summary: Direct, conclusive answer to the clinical question.\n"
+    "2. Pathophysiological & Evidence Analysis: In-depth clinical reasoning, citing "
+    "supporting evidence where it directly confirms key facts.\n"
+    "3. Clinical Management & Risk Stratification: Practical implications, differential "
+    "considerations, risk factors, and management guidelines drawn from established "
+    "clinical practice.\n"
+    "4. Conclusion & Prognostic Outlook: Concise synthesis emphasizing patient outcomes "
+    "and best practices."
+)
+
+
+def synthesis_instructions(evidence_tag: Optional[str] = None) -> str:
+    """Answer-synthesis instructions shared by ALL benchmark arms.
+
+    Baseline, Vanilla RAG and HCAD-RAG receive identical instructions and
+    differ only in the evidence they are given, so judge-score differences
+    reflect evidence selection rather than prompt wording. `evidence_tag`
+    is the citation tag the arm's evidence block uses ("Evidence",
+    "Context"); None means no retrieved evidence (baseline / abstention).
+    """
+    if evidence_tag:
+        grounding = (
+            "Use the relevant retrieved evidence as the factual foundation, then "
+            "synthesize it with established clinical knowledge to answer the full "
+            "question. Do not let gaps in the retrieved evidence make the answer "
+            "incomplete. Support claims with evidence tags "
+            f"(e.g. [{evidence_tag} N]) only when the cited item directly supports "
+            "the claim, and make clear which points rely on established clinical "
+            "knowledge instead. Never imply that a retrieved item supports details "
+            "it does not contain."
+        )
+    else:
+        grounding = (
+            "No retrieved evidence is available. Draw on established clinical "
+            "knowledge to answer the full question."
+        )
+    return "\n\n".join([
+        "Instructions for Clinical Synthesis:",
+        grounding,
+        _SYNTHESIS_COVERAGE,
+        _SYNTHESIS_LENGTH,
+        _SYNTHESIS_STRUCTURE,
+    ])
+
+
+def _evidence_source(context: Dict[str, Any]) -> str:
+    """Provenance label for an evidence item (knowledge graph vs literature)."""
+    meta = context.get("metadata") or {}
+    source = context.get("source", "")
+    relation = meta.get("display_relation") or meta.get("relation") or ""
+    if source == "nary_fact":
+        label = "PrimeKG n-ary fact"
+    elif meta.get("doc_type") == "clinical_text" or meta.get("source") == "pmc":
+        return "PubMed Central article"
+    elif relation or source in ("graph", "graph_hyperedge"):
+        label = "PrimeKG knowledge graph"
+    else:
+        return "clinical literature"
+    return f"{label}, relation: {relation}" if relation else label
+
+
 COT_EXEMPLARS = [
     {
         "question": "A 45-year-old man presents with acute substernal chest pain. ECG shows ST elevation in leads II, III, and aVF. Which immediate medication reduces mortality in this setting?",
@@ -74,9 +151,13 @@ class PromptBuilder:
         self.system_prompt = system_prompt
 
     def format_context(self, context: dict, index: int = 0) -> str:
-        """Format a single context dict as a readable evidence string."""
-        meta = context.get("metadata") or {}
-        doc = context.get("document", "")
+        """Format a single context dict as a readable evidence string.
+
+        One line of provenance (source + PrimeKG relation) and the evidence
+        text itself. The previous format repeated every triple twice
+        ("Verified Biomedical Relation ..." + "Clinical Context ...") and
+        labelled unverified retrieval output as "Verified".
+        """
         # explicit None checks - a legitimate 0.0 score
         # is not falsy-overridden by a secondary score.
         score = context.get("phi_final")
@@ -85,20 +166,8 @@ class PromptBuilder:
         if score is None:
             score = 0.0
 
-        head = meta.get("head_name", "")
-        rel = meta.get("display_relation") or meta.get("relation") or ""
-        tail = meta.get("tail_name", "")
-        h_type = meta.get("head_type", "")
-        t_type = meta.get("tail_type", "")
-
-        parts = [f"[Evidence {index}] (Relevance Score: {score:.3f})"]
-        if head and rel and tail:
-            parts.append(
-                f"  Verified Biomedical Relation: {head} ({h_type}) is documented with relation '{rel.replace('_', ' ')}' concerning {tail} ({t_type})."
-            )
-        if doc:
-            parts.append(f"  Clinical Context: {doc}")
-        return "\n".join(parts)
+        header = f"[Evidence {index}] ({_evidence_source(context)}; relevance {score:.3f})"
+        return f"{header}\n{context_document(context)}"
 
     def format_contexts_block(self, contexts: list[dict]) -> str:
         """Format a list of contexts as a numbered evidence block."""
@@ -115,32 +184,18 @@ class PromptBuilder:
         contexts: list[dict],
         system_prompt: Optional[str] = None,
     ) -> list[dict]:
-        """Build an optimized clinical synthesis prompt with retrieved context evidence."""
+        """Build the clinical synthesis prompt with retrieved context evidence.
+
+        An empty context list (gate abstention) yields the same no-evidence
+        instructions the baseline receives - parametric mode is never worse
+        prompted than the no-retrieval arm.
+        """
         context_block = self.format_contexts_block(contexts)
 
         user_content = (
             f"Clinical Query:\n{query}\n\n"
-            f"Verified Evidence from Biomedical Hypergraph & Literature:\n{context_block}\n\n"
-            "Instructions for Clinical Synthesis:\n"
-            "Use relevant retrieved evidence as a factual foundation, then synthesize it with "
-            "established clinical knowledge to answer the full question. Do not let gaps in the "
-            "retrieved evidence make the answer incomplete. Cover relevant pathophysiology, "
-            "first- and second-line management, monitoring, differential diagnosis, and "
-            "complications when the question calls for them; omit tangential details.\n\n"
-            "Support claims with evidence tags (e.g. [Evidence 1]) only when the cited item "
-            "directly supports the claim. Make clear which points are supported by retrieved "
-            "evidence and which rely on established clinical knowledge. Never imply that a "
-            "retrieved item supports details it does not contain. Use relevant additional "
-            "clinical context to make the answer complete and useful, while avoiding "
-            "speculation or unsupported patient-specific recommendations.\n\n"
-            "IMPORTANT: Keep your response focused and concise (under 800 words total). "
-            "Prioritize clinical precision over exhaustive enumeration. Avoid repeating "
-            "the same point across sections.\n\n"
-            "Structure your response clearly with the following sections:\n"
-            "1. Executive Clinical Summary: Direct, conclusive answer to the clinical question.\n"
-            "2. Pathophysiological & Evidence Analysis: In-depth clinical reasoning. Cite specific evidence tags where they directly confirm key facts, and expand with detailed clinical context from established medical knowledge.\n"
-            "3. Clinical Management & Risk Stratification: Practical implications, differential considerations, risk factors, and management guidelines drawn from established clinical practice.\n"
-            "4. Conclusion & Prognostic Outlook: Concise synthesis emphasizing patient outcomes and best practices."
+            f"Retrieved Evidence:\n{context_block}\n\n"
+            f"{synthesis_instructions('Evidence' if contexts else None)}"
         )
 
         return [

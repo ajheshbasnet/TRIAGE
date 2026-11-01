@@ -1,7 +1,7 @@
 import os
 import logging
 from typing import Any, Dict, List, Optional, Tuple
-from src.config import EVIDENCE_WORD_BUDGET, MAX_EVIDENCE_ITEMS
+from src.config import EVIDENCE_WORD_BUDGET, MAX_EVIDENCE_ITEMS, MAX_EVIDENCE_PER_RELATION
 
 logger = logging.getLogger(__name__)
 
@@ -27,10 +27,12 @@ class DecisionGate:
         max_evidence_items: int = MAX_EVIDENCE_ITEMS,
         token_budget_words: int = EVIDENCE_WORD_BUDGET,
         use_jev: bool = True,
+        max_per_relation: int = MAX_EVIDENCE_PER_RELATION,
     ):
         self.min_relevance_score = min_relevance_score
         self.max_evidence_items = max_evidence_items
         self.token_budget_words = token_budget_words
+        self.max_per_relation = max_per_relation
         self.use_jev = use_jev
 
         self.client: Optional[Any] = None
@@ -124,9 +126,17 @@ class DecisionGate:
             except Exception as e:
                 logger.warning("JEV decision failed: %s. Continuing with calibrated gating.", e)
 
-        verified = []
+        # Relevance order is preserved (candidates arrive sorted by phi, with
+        # the JEV-selected item promoted when the live gate ran). Diversity
+        # is a soft cap: at most `max_per_relation` items of one relation
+        # type are admitted before the gate moves on; over-cap items are
+        # only used if budget remains. The previous rule put one item per
+        # relation type FIRST, which pushed every PMC prose chunk (no
+        # relation label) behind all KG triples regardless of relevance.
+        primary, deferred = [], []
         seen_triples = set()
-        relation_buckets = {}
+        seen_docs = set()
+        relation_counts: Dict[str, int] = {}
 
         for c in candidates:
             score = c.get("phi_final", c.get("score", 0.0))
@@ -134,34 +144,31 @@ class DecisionGate:
                 continue
 
             meta = c.get("metadata") or {}
-            head = meta.get("head_name", "")
-            rel = meta.get("relation", "")
-            tail = meta.get("tail_name", "")
+            head = meta.get("head_name", "") or ""
+            rel = meta.get("relation", "") or ""
+            tail = meta.get("tail_name", "") or ""
             triple_key = (head.lower(), rel.lower(), tail.lower())
+            doc_key = " ".join(str(c.get("document") or "").lower().split())
 
             # Skip duplicate facts to conserve prompt budget
             if any(triple_key) and triple_key in seen_triples:
                 continue
-
+            if doc_key and doc_key in seen_docs:
+                continue
             if any(triple_key):
                 seen_triples.add(triple_key)
+            if doc_key:
+                seen_docs.add(doc_key)
 
-            verified.append(c)
             relation = (meta.get("relation") or meta.get("display_relation") or "").strip().lower()
+            if relation and relation_counts.get(relation, 0) >= self.max_per_relation:
+                deferred.append(c)
+                continue
             if relation:
-                relation_buckets.setdefault(relation, []).append(c)
+                relation_counts[relation] = relation_counts.get(relation, 0) + 1
+            primary.append(c)
 
-        # sort each relation bucket by score so the best
-        # candidate per relation is selected (previously first-inserted won).
-        for relation, items in relation_buckets.items():
-            items.sort(key=lambda c: c.get("phi_final", c.get("score", 0.0)), reverse=True)
-        diverse = [items[0] for items in relation_buckets.values()]
-        diverse_ids = {id(candidate) for candidate in diverse}
-        remaining = [
-            candidate for candidate in verified
-            if id(candidate) not in diverse_ids
-        ]
-        ordered = diverse + remaining
+        ordered = primary + deferred
 
         # Keep the combined prompt evidence within the configured word budget.
         # budgets and floors are now hard invariants -

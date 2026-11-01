@@ -179,21 +179,10 @@ class BaselineLLM:
     def generate(self, query: str) -> str:
         """Generate a free-text answer to a medical query (no retrieval)."""
         from src.core.llm_client import UnifiedLLMClient
+        from src.core.prompt_builder import synthesis_instructions
 
-        user_content = (
-            f"Clinical Query:\n{query}\n\n"
-            "Instructions for Clinical Synthesis:\n"
-            "Draw from your expert clinical domain expertise to deliver a comprehensive, "
-            "logically rigorous, and actionable clinical answer.\n\n"
-            "IMPORTANT: Keep your response focused and concise (under 800 words total). "
-            "Prioritize clinical precision over exhaustive enumeration. Avoid repeating "
-            "the same point across sections.\n\n"
-            "Structure your response clearly with the following sections:\n"
-            "1. Executive Clinical Summary: Direct, conclusive answer to the clinical question.\n"
-            "2. Pathophysiological & Evidence Analysis: In-depth clinical reasoning. Cite specific evidence where it directly confirms key facts, and expand with detailed clinical context from established medical knowledge.\n"
-            "3. Clinical Management & Risk Stratification: Practical implications, differential considerations, risk factors, and management guidelines drawn from established clinical practice.\n"
-            "4. Conclusion & Prognostic Outlook: Concise synthesis emphasizing patient outcomes and best practices."
-        )
+        # Same synthesis instructions as both RAG arms (no-evidence variant).
+        user_content = f"Clinical Query:\n{query}\n\n{synthesis_instructions(None)}"
         messages = [
             {"role": "system", "content": BASELINE_SYSTEM_PROMPT},
             {"role": "user", "content": user_content},

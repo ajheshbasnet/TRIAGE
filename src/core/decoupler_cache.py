@@ -52,7 +52,7 @@ logger = logging.getLogger(__name__)
 
 # Bump when the extraction or Gram-Schmidt math itself changes in a way not
 # captured by the config constants below (e.g. the MGS pass structure).
-DECOUPLER_FORMULA_VERSION = "mgs2+presence+vocab"
+DECOUPLER_FORMULA_VERSION = "mgs2+presence+vocab+wordbound"
 
 
 def decoupler_config_version(extra_components: Optional[list] = None) -> str:

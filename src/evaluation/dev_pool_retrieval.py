@@ -1,23 +1,33 @@
 """Deliverable-B development-pool retrieval harness (Phase 3).
 
-Measures the four coupled retrieval changes on the frozen development pool
+Measures the coupled retrieval changes on the frozen development pool
 with retrieval-only metrics (no judge, no generation):
 
   1. symmetric two-pass orthonormal MGS decoupling (always on - it is a
      correctness fix, not a toggle),
   2. query-conditioned channel-presence masking (HCAD_PRESENCE_MASKING),
   3. PrimeKG relation-vocabulary mapping (HCAD_RELATION_VOCAB),
-  4. Gate-2 saturation cap tau_eff = min(tau_sat, max(Phi_min, mu + k*sigma))
+  4. hybrid dense + structured scoring with isotropic channel similarity
+     (HCAD_DENSE_WEIGHT, HCAD_ANISO_DIM_WEIGHTING),
+  5. Gate-2 saturation cap tau_eff = min(tau_sat, max(Phi_min, mu + k*sigma))
      with tau_sat calibrated here as the 25th percentile of gold
-     development candidate scores (HCAD_TAU_SAT).
+     development candidate scores (HCAD_TAU_SAT), on the hybrid score
+     scale it is applied to.
 
-GO/STOP (from the epistemic review): the full configuration must improve
-paired mean Recall@5 by >= +0.08 and NDCG@5 by >= +0.06 over the unmodified
-baseline on the development split. Citation precision (>= 0.95) is measured
+The baseline arm pins the legacy scorer (structure-only phi, block
+anisotropic weights, no masking/vocab, desc expansion) so the deltas cover
+every toggleable change. Non-toggleable correctness fixes (word-boundary
+keyword matching, real hyperedge triples, canonical triple orientation)
+apply to all arms.
+
+GO/STOP: GO when paired mean NDCG@5 does not decrease and Recall@5 drops by
+no more than 0.10, or NDCG@5 improves (thresholds overridable via
+HCAD_GO_DELTA_RECALL / HCAD_GO_DELTA_NDCG). Citation precision is measured
 by the subsequent test-pool confirmation run, not by this harness.
 
 All calibration happens on the development pool only; the test pool stays
-untouched until the GO decision.
+untouched until the GO decision. tau_sat is calibrated and measured on the
+same dev questions (in-sample) - its effect must be confirmed on test.
 """
 
 from __future__ import annotations
@@ -44,13 +54,20 @@ logger = logging.getLogger(__name__)
 GO_DELTA_RECALL = float(os.environ.get("HCAD_GO_DELTA_RECALL", "-0.10"))
 GO_DELTA_NDCG = float(os.environ.get("HCAD_GO_DELTA_NDCG", "0.00"))
 
-# (name, env overrides). The baseline disables masking and vocab mapping and
-# pins the desc expansion rule so the paired comparison isolates exactly
-# the Deliverable-B changes against a pure Phase 3 baseline.
+# Legacy scorer: structure-only phi with the block anisotropic weights.
+_LEGACY_SCORER = {"HCAD_DENSE_WEIGHT": "0", "HCAD_ANISO_DIM_WEIGHTING": "1"}
+
+# (name, env overrides). Each arm adds one change to the previous one, so
+# every paired delta is attributable. The baseline also pins the desc
+# expansion rule (pure Phase 3 baseline). The hybrid arm is the deployed
+# default scorer (dense weight and isotropic weighting from config).
 CONFIGS = [
-    ("baseline", {"HCAD_PRESENCE_MASKING": "0", "HCAD_RELATION_VOCAB": "0", "HCAD_EXPANSION_RULE": "desc"}),
-    ("masking", {"HCAD_PRESENCE_MASKING": "1", "HCAD_RELATION_VOCAB": "0"}),
-    ("masking_vocab", {"HCAD_PRESENCE_MASKING": "1", "HCAD_RELATION_VOCAB": "1"}),
+    ("baseline", {"HCAD_PRESENCE_MASKING": "0", "HCAD_RELATION_VOCAB": "0",
+                  "HCAD_EXPANSION_RULE": "desc", **_LEGACY_SCORER}),
+    ("masking", {"HCAD_PRESENCE_MASKING": "1", "HCAD_RELATION_VOCAB": "0", **_LEGACY_SCORER}),
+    ("masking_vocab", {"HCAD_PRESENCE_MASKING": "1", "HCAD_RELATION_VOCAB": "1", **_LEGACY_SCORER}),
+    ("hybrid", {"HCAD_PRESENCE_MASKING": "1", "HCAD_RELATION_VOCAB": "1",
+                "HCAD_DENSE_WEIGHT": None, "HCAD_ANISO_DIM_WEIGHTING": None}),
 ]
 
 
@@ -280,15 +297,16 @@ def run_retrieval_eval(
 
     results: Dict[str, Any] = {"pool": pool, "num_samples": len(samples), "k": RETRIEVAL_K}
 
-    # 1-3: baseline / masking / masking+vocab (paired, same questions).
+    # 1-4: baseline / masking / masking+vocab / hybrid (paired, same questions).
     for name, env in CONFIGS:
         logger.info("Evaluating configuration: %s", name)
         results[name] = _evaluate_config(hcad_rag, samples, env)
 
-    # 4: full configuration with the Gate-2 saturation cap. tau_sat is
-    # calibrated from the gold candidate scores of the masking+vocab run -
-    # calibration and measurement both stay on the dev pool.
-    tau_sat_value = results["masking_vocab"]["gold_score_percentiles"]["p25"]
+    # 5: full configuration with the Gate-2 saturation cap. tau_sat is
+    # calibrated from the gold candidate scores of the hybrid run - the
+    # same score scale the deployed retriever thresholds on. Calibration
+    # and measurement both stay on the dev pool.
+    tau_sat_value = results["hybrid"]["gold_score_percentiles"]["p25"]
     if tau_sat_value is None:
         logger.warning(
             "No gold candidate found in any pool - Gate-2 cap disabled for "
@@ -304,6 +322,8 @@ def run_retrieval_eval(
             {
                 "HCAD_PRESENCE_MASKING": "1",
                 "HCAD_RELATION_VOCAB": "1",
+                "HCAD_DENSE_WEIGHT": None,
+                "HCAD_ANISO_DIM_WEIGHTING": None,
                 "HCAD_TAU_SAT": str(tau_sat_value),
             },
         )

@@ -28,6 +28,11 @@ class ClinicalFact:
     confidence: float = 1.0
     source_id: str = ""
     direction: str = "directed"     # "directed" | "undirected"
+    # Every head sharing this (tail, relation) context, up to an indexing
+    # cap. `roles` holds only the displayed subset (max_arity); indexing
+    # on all members means a query entity is found even when it is not
+    # among the first few displayed heads.
+    members: tuple = ()
 
     @property
     def head_names(self) -> list:
@@ -47,7 +52,7 @@ class FactIndex:
     def add(self, fact: ClinicalFact) -> None:
         idx = len(self.facts)
         self.facts.append(fact)
-        for e in set(fact.roles.values()):
+        for e in set(fact.roles.values()) | set(fact.members):
             self.by_entity[e].append(idx)
             low = str(e).lower()
             if low not in self.by_entity:
@@ -64,6 +69,7 @@ class FactIndex:
                 if predicate is not None and f.predicate != predicate:
                     continue
                 roles_l = {str(r).lower() for r in f.roles.values()}
+                roles_l |= {str(m).lower() for m in f.members}
                 overlap = len(roles_l & {str(a).lower() for a in anchors}) / max(len(f.roles), 1)
                 hits[i] += f.confidence * (0.5 + 0.5 * overlap)
         ranked = sorted(hits.items(), key=lambda kv: -kv[1])[:top_k]
@@ -85,7 +91,27 @@ class FactIndex:
                 break
         return out
 
-    def render(self, fact: ClinicalFact) -> str:
+    @staticmethod
+    def displayed_heads(fact: ClinicalFact, focus=None) -> list:
+        """Heads to display, with any focus (query) entities listed first.
+
+        A focus entity that is a member of the fact but not among the
+        displayed subset replaces the last displayed heads, so the
+        rendered evidence always names the entity the query asked about.
+        """
+        heads = list(fact.head_names)
+        if not focus:
+            return heads
+        focus_l = {str(f).lower() for f in focus}
+        anchor = str(fact.tail_name or "").lower()
+        pool = list(dict.fromkeys(heads + [m for m in fact.members if m not in heads]))
+        hits = [m for m in pool if str(m).lower() in focus_l and str(m).lower() != anchor]
+        if not hits:
+            return heads
+        rest = [h for h in heads if h not in hits]
+        return (hits + rest)[: max(len(heads), len(hits))]
+
+    def render(self, fact: ClinicalFact, focus=None) -> str:
         """Faithful, role-directed evidence rendering.
 
         Directed facts render as ``heads --[predicate]--> tail`` (asymmetric);
@@ -94,7 +120,7 @@ class FactIndex:
         ONE negation token - their PrimeKG name already encodes absence, so a
         second cue would produce double negation ("does not lack").
         """
-        heads = ", ".join(fact.head_names)
+        heads = ", ".join(self.displayed_heads(fact, focus))
         tail = fact.tail_name or "UNKNOWN"
 
         if fact.polarity == "negated":
@@ -128,8 +154,19 @@ class FactIndex:
                 f"{doubled.group()!r} in {rendered!r}"
             )
 
+# Clinical relations are indexed first so that a memory cap can never
+# starve them in favour of molecular-only contexts.
+RELATION_PRIORITY = [
+    "indication", "contraindication", "off-label use", "drug_effect",
+    "disease_phenotype_positive", "disease_phenotype_negative",
+    "disease_protein", "drug_protein", "biomarker", "disease_disease",
+    "phenotype_protein", "protein_protein",
+]
+
+
 def build_fact_index_from_kg(kg, max_arity: int = 6, min_members: int = 2,
-                             max_facts_per_tail: int = 50,
+                             max_facts_per_relation: int = 15_000,
+                             max_index_members: int = 30,
                              relation_whitelist=None) -> "FactIndex":
     """Mine n-ary clinical facts from PrimeKG shared-tail contexts.
 
@@ -138,17 +175,18 @@ def build_fact_index_from_kg(kg, max_arity: int = 6, min_members: int = 2,
     PrimeKG gives strictly better facts for free: every (tail, relation)
     context groups all heads that share it, e.g. every drug contraindicated
     in disease C becomes ONE n-ary fact with provenance.
+
+    Coverage: the previous builder stopped after the first 10,000 contexts
+    in edge-iteration order (an arbitrary subset) and indexed only the 6
+    lowest-id heads. Contexts are now taken relation by relation in
+    clinical priority order with a per-relation cap, and every member (up
+    to max_index_members) is indexed while max_arity heads are displayed.
     """
     idx = FactIndex()
     # Default to clinically relevant relations only (same policy as the
     # vector store) - indexing all ~8M edges (incl. DDI) OOMs the process.
     if relation_whitelist is None:
-        relation_whitelist = {
-            "contraindication", "indication", "off-label use", "drug_effect",
-            "disease_disease", "drug_protein", "disease_protein",
-            "disease_phenotype_positive", "disease_phenotype_negative",
-            "biomarker", "phenotype_protein", "protein_protein",
-        }
+        relation_whitelist = set(RELATION_PRIORITY)
     by_context = {}
     for u, v, d in kg.graph.edges(data=True):
         rel = d.get("relation", "unknown")
@@ -156,23 +194,36 @@ def build_fact_index_from_kg(kg, max_arity: int = 6, min_members: int = 2,
             continue
         by_context.setdefault((v, rel), []).append(u)
 
+    def _name(node):
+        return kg.graph.nodes[node].get("name", str(node)) if node in kg.graph else str(node)
+
+    ordered_relations = [r for r in RELATION_PRIORITY if r in relation_whitelist]
+    ordered_relations += sorted(set(relation_whitelist) - set(ordered_relations))
+    by_relation: dict = {}
     for (tail, rel), heads in by_context.items():
-        if len(heads) < min_members:
-            continue
-        heads = sorted(set(heads))[: max_arity]
-        tail_name = kg.graph.nodes[tail].get("name", str(tail)) if tail in kg.graph else str(tail)
-        head_names = [kg.graph.nodes[h].get("name", str(h)) if h in kg.graph else str(h)
-                      for h in heads]
-        roles = {"member_%d" % i: n for i, n in enumerate(head_names)}
-        roles["anchor"] = tail_name
-        idx.add(ClinicalFact(
-            predicate=rel,
-            roles=roles,
-            polarity="negated" if rel in NEGATED_RELATIONS else "asserts",
-            confidence=0.9,
-            source_id="primekg",
-            direction="undirected" if rel in UNDIRECTED_RELATIONS else "directed",
-        ))
-        if len(idx.facts) >= max_facts_per_tail * 200:  # global safety cap
-            break
+        by_relation.setdefault(rel, []).append((tail, heads))
+
+    for rel in ordered_relations:
+        n_rel = 0
+        for tail, heads in by_relation.get(rel, []):
+            unique_heads = sorted(set(heads))
+            if len(unique_heads) < min_members:
+                continue
+            tail_name = _name(tail)
+            head_names = [_name(h) for h in unique_heads[: max_arity]]
+            members = tuple(_name(h) for h in unique_heads[: max_index_members])
+            roles = {"member_%d" % i: n for i, n in enumerate(head_names)}
+            roles["anchor"] = tail_name
+            idx.add(ClinicalFact(
+                predicate=rel,
+                roles=roles,
+                polarity="negated" if rel in NEGATED_RELATIONS else "asserts",
+                confidence=0.9,
+                source_id="primekg",
+                direction="undirected" if rel in UNDIRECTED_RELATIONS else "directed",
+                members=members,
+            ))
+            n_rel += 1
+            if n_rel >= max_facts_per_relation:
+                break
     return idx

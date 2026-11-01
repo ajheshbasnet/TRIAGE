@@ -309,7 +309,7 @@ def cmd_serve(args):
 def cmd_evaluate(args):
     """Alias of base-paper: the benchmark evaluates all three systems."""
     from src.evaluation.run_base_paper_benchmark import run_benchmark
-    logger.info("Evaluating system %s (%d samples)...", args.system, args.samples)
+    logger.info("Evaluating all three systems (%d samples)...", args.samples)
     run_benchmark(num_samples=args.samples, question_pool=args.question_pool)
 
 def cmd_benchmark(args):
@@ -355,7 +355,7 @@ def cmd_retrieval_eval(args):
     )
     decision = (results.get("go_stop") or {}).get("decision", "n/a")
     logger.info("GO/STOP decision: %s", decision)
-    for name in ("baseline", "masking", "masking_vocab", "full"):
+    for name in ("baseline", "masking", "masking_vocab", "hybrid", "full"):
         cfg = results.get(name)
         if cfg:
             logger.info(

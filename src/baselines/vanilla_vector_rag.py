@@ -229,22 +229,14 @@ class VanillaVectorRAG:
             remaining_words -= len(selected.split())
         context_block = "\n\n---\n\n".join(context_parts)
 
+        from src.core.prompt_builder import synthesis_instructions
+
+        # Identical synthesis instructions to HCAD-RAG and the baseline; the
+        # arms differ only in the evidence supplied.
         prompt = (
             f"Clinical Query:\n{query}\n\n"
             f"Retrieved Contexts:\n{context_block}\n\n"
-            f"Instructions for Clinical Synthesis:\n"
-            f"Use the provided contexts as primary evidence. If the contexts are insufficient "
-            f"or only partially relevant, supplement with your clinical knowledge to provide "
-            f"a complete and accurate answer. Clearly distinguish between context-supported "
-            f"facts and your own medical reasoning.\n\n"
-            f"IMPORTANT: Keep your response focused and concise (under 800 words total). "
-            f"Prioritize clinical precision over exhaustive enumeration. Avoid repeating "
-            f"the same point across sections.\n\n"
-            f"Structure your response clearly with the following sections:\n"
-            f"1. Executive Clinical Summary: Direct, conclusive answer to the clinical question.\n"
-            f"2. Pathophysiological & Evidence Analysis: In-depth clinical reasoning. Cite specific contexts where they directly confirm key facts, and expand with detailed clinical context from established medical knowledge.\n"
-            f"3. Clinical Management & Risk Stratification: Practical implications, differential considerations, risk factors, and management guidelines.\n"
-            f"4. Conclusion & Prognostic Outlook: Concise synthesis emphasizing patient outcomes and best practices."
+            f"{synthesis_instructions('Context')}"
         )
         return prompt
 

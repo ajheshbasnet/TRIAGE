@@ -36,27 +36,8 @@ logger = logging.getLogger(__name__)
 # raise it on an idle A100 for faster ingestion.
 EMBED_BATCH = int(os.getenv("EMBED_BATCH", "128"))
 
-def _triple_to_sentence(head: str, relation: str, tail: str) -> str:
-    """Convert a KG triple to a readable natural language sentence."""
-    rel_map = {
-        "drug_protein": "targets protein",
-        "carries": "carries gene",
-        "cause": "causes",
-        "contraindication": "is contraindicated in",
-        "indication": "is indicated for",
-        "off-label use": "has off-label use in",
-        "drug_drug": "interacts with drug",
-        "phenotype_protein": "is associated with protein",
-        "protein_protein": "interacts with protein",
-        "disease_phenotype_positive": "presents with phenotype",
-        "disease_phenotype_negative": "lacks phenotype",
-        "disease_protein": "is associated with protein",
-        "biomarker": "is a biomarker for",
-        "disease_disease": "is related to disease",
-        "pathway_protein": "involves protein",
-    }
-    readable_rel = rel_map.get(relation, relation.replace("_", " "))
-    return f"{head} {readable_rel} {tail}."
+# Shared with the retriever so every channel renders a triple identically.
+from src.data.triple_text import triple_to_sentence as _triple_to_sentence
 
 def build_vector_store(
     kg_csv_path: Optional[Path] = None,

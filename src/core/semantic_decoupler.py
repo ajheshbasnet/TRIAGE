@@ -65,6 +65,21 @@ _MODIFIER_KEYWORDS: list[str] = [
     "within", "initially", "subsequently", "eventually",
 ]
 
+
+def _word_patterns(keywords: list[str]) -> list[tuple[str, re.Pattern]]:
+    """Whole-word, case-insensitive patterns (order preserved).
+
+    Plain substring tests made "no" match "carcinoma"/"known" and "not"
+    match "NOTCH1", so nearly every candidate carried a spurious negation
+    modifier and read as modifier-present. Same word-boundary rule the
+    RelationExtractor negation detector uses.
+    """
+    return [(kw, re.compile(rf"\b{re.escape(kw)}\b", re.IGNORECASE)) for kw in keywords]
+
+
+_RELATION_PATTERNS = _word_patterns(_RELATION_KEYWORDS)
+_MODIFIER_PATTERNS = _word_patterns(_MODIFIER_KEYWORDS)
+
 class SemanticDecoupler:
     """Decouples biomedical text into Entity, Relation, and Modifier embeddings."""
 
@@ -203,12 +218,8 @@ class SemanticDecoupler:
             if rel_parts:
                 return " ".join(rel_parts)
 
-        # Scan for relation keywords in the text
-        text_lower = (text or "").lower()
-        found: list[str] = []
-        for kw in _RELATION_KEYWORDS:
-            if kw in text_lower:
-                found.append(kw)
+        # Scan for relation keywords in the text (whole words only)
+        found = [kw for kw, pat in _RELATION_PATTERNS if pat.search(text or "")]
         if found:
             return " ".join(found)
 
@@ -240,12 +251,8 @@ class SemanticDecoupler:
             if modifiers:
                 return " ".join(modifiers)
 
-        # Scan for modifier keywords
-        text_lower = text.lower()
-        found: list[str] = []
-        for kw in _MODIFIER_KEYWORDS:
-            if kw in text_lower:
-                found.append(kw)
+        # Scan for modifier keywords (whole words only)
+        found = [kw for kw, pat in _MODIFIER_PATTERNS if pat.search(text)]
         if found:
             return " ".join(found)
 
@@ -259,9 +266,8 @@ class SemanticDecoupler:
                         if entity_text:
                             residual = residual.replace(entity_text, "")
         # Also strip matched relation keywords so modifier is clean
-        for kw in _RELATION_KEYWORDS:
-            if kw in residual.lower():
-                residual = re.sub(re.escape(kw), "", residual, flags=re.IGNORECASE)
+        for _kw, pat in _RELATION_PATTERNS:
+            residual = pat.sub("", residual)
         residual = re.sub(r"\s+", " ", residual).strip()
         # punctuation-only residue (e.g. "." after entity stripping) is not
         # modifier content: it would embed as noise and falsely mark the
@@ -287,6 +293,51 @@ class SemanticDecoupler:
                     torch.cuda.empty_cache()
                 vec_np = self._model.encode(text, convert_to_numpy=True, normalize_embeddings=True)
             return torch.from_numpy(vec_np.astype(np.float32))
+
+    def encode_texts(self, texts: list[str]) -> np.ndarray:
+        """Unit-normalized full-text embeddings, shape (N, d).
+
+        Used for the dense half of the hybrid score. Repeat strings (the
+        same KG sentence across queries) are served from the shared
+        config-versioned embedding LRU.
+        """
+        if not texts:
+            return np.empty((0, self._dim), dtype=np.float32)
+        self._load_model()
+        cache = self._get_cache()
+        out: list[np.ndarray | None] = [None] * len(texts)
+        pending: dict[str, list[int]] = {}
+        for idx, t in enumerate(texts):
+            vec = cache.get_embedding(t, dim=self._dim) if cache is not None else None
+            if vec is not None:
+                out[idx] = vec
+            else:
+                pending.setdefault(t, []).append(idx)
+        if pending:
+            to_encode = list(pending)
+            with torch.no_grad():
+                try:
+                    encoded = self._model.encode(
+                        to_encode, batch_size=32, show_progress_bar=False,
+                        convert_to_numpy=True, normalize_embeddings=True,
+                    )
+                except Exception as e:
+                    logger.warning("Dense encode failed on device (%s); retrying on CPU.", e)
+                    self._model = self._model.to("cpu")
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
+                    encoded = self._model.encode(
+                        to_encode, batch_size=32, show_progress_bar=False,
+                        convert_to_numpy=True, normalize_embeddings=True,
+                    )
+            encoded = np.atleast_2d(np.asarray(encoded, dtype=np.float32))
+            for j, t in enumerate(to_encode):
+                vec = encoded[j]
+                if cache is not None:
+                    cache.put_embedding(t, vec)
+                for idx in pending[t]:
+                    out[idx] = vec
+        return np.stack([np.asarray(v, dtype=np.float32) for v in out])
 
     @staticmethod
     def _absent_anchor(basis: list[torch.Tensor], d: int) -> torch.Tensor:

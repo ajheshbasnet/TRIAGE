@@ -1,24 +1,34 @@
 import logging
-from typing import Optional
+from typing import Any, Optional
 
 import numpy as np
 
 from src.config import (
+    CANDIDATE_POOL_MAX,
     CHANNEL_MISSING_PRIOR,
     ENABLE_FEW_SHOT,
+    ENTITY_LINK_THRESHOLD,
     FILTERING_K,
+    GRAPH_TRIPLES_PER_ENTITY,
+    GRAPH_TRIPLES_PER_HYPEREDGE,
     LLM_MAX_TOKENS,
     LLM_MODEL,
     LLM_TEMPERATURE,
     EMBEDDING_MODEL_NAME,
     MAX_EVIDENCE_ITEMS,
     MIN_PHI_SCORE,
+    NARY_FACTS_PER_QUERY,
+    QUERY_RELATION_TO_PRIMEKG,
     SCORE_WEIGHT_ENTITY,
     SCORE_WEIGHT_MODIFIER,
     SCORE_WEIGHT_RELATION,
+    aniso_dim_weighting_enabled,
+    dense_weight,
+    map_query_relation,
     map_relation_text,
     presence_masking_enabled,
 )
+from src.data.triple_text import canonical_direction, triple_to_sentence
 
 logger = logging.getLogger(__name__)
 
@@ -235,27 +245,27 @@ class HCADRetriever:
         if entity_name in self._entity_res_cache:
             return self._entity_res_cache[entity_name]
 
-        # Try SapBERT first
-        if self._entity_linker is not None:
+        # Exact (case-insensitive) PrimeKG name first: precise and cheap.
+        # SapBERT nearest-neighbour linking previously ran first at a 0.50
+        # cosine floor, which re-mapped names that exist verbatim in the
+        # graph onto near neighbours and expanded the wrong entity.
+        res = self._find_entity_in_graph(entity_name)
+        if res is None and entity_name and entity_name.strip():
+            res = self._find_entity_in_graph(entity_name.lower())
+
+        if res is None and self._entity_linker is not None:
             try:
-                matches = self._entity_linker.link(entity_name, top_k=1, threshold=0.50)
+                matches = self._entity_linker.link(
+                    entity_name, top_k=1, threshold=ENTITY_LINK_THRESHOLD)
                 if matches:
-                    canonical = matches[0]["canonical_name"]
-                    score = matches[0]["score"]
+                    res = matches[0]["canonical_name"]
                     logger.debug(
-                        f"SapBERT linked '{entity_name}' → '{canonical}' (score={score:.3f})"
+                        "SapBERT linked '%s' -> '%s' (score=%.3f)",
+                        entity_name, res, matches[0]["score"],
                     )
-                    self._entity_res_cache[entity_name] = canonical
-                    return canonical
             except Exception as e:
                 logger.warning(f"SapBERT linking failed for '{entity_name}': {e}")
 
-        # Fallback: string matching
-        res = self._find_entity_in_graph(entity_name)
-        # Cache the result, but ensure we don't cache None for empty strings
-        if res is None and entity_name and entity_name.strip():
-            # Try case-insensitive fallback
-            res = self._find_entity_in_graph(entity_name.lower())
         self._entity_res_cache[entity_name] = res
         return res
 
@@ -307,15 +317,63 @@ class HCADRetriever:
 
         return None
 
+    @staticmethod
+    def _kg_candidate(head: str, head_type: str, relation: str, tail: str,
+                      tail_type: str, score: float, source: str,
+                      display_relation: Optional[str] = None) -> dict:
+        """A KG-triple candidate rendered exactly like the vector store.
+
+        The edge is first oriented canonically (PrimeKG stores both
+        directions), so "X is indicated for Y" from the vector store and
+        from graph expansion produce the SAME document and dedup.
+        """
+        head, head_type, tail, tail_type, _ = canonical_direction(
+            head, head_type, relation, tail, tail_type)
+        return {
+            "document": triple_to_sentence(head, relation, tail),
+            "metadata": {
+                "head_name": head,
+                "tail_name": tail,
+                "relation": relation,
+                "display_relation": display_relation or relation,
+                "head_type": head_type,
+                "tail_type": tail_type,
+            },
+            "score": score,
+            "source": source,
+        }
+
+    @staticmethod
+    def _query_primekg_relations(relations: Optional[list]) -> set:
+        """PrimeKG relation types the query's rule relations ask about."""
+        wanted: set = set()
+        for rel in relations or []:
+            if isinstance(rel, dict):
+                wanted |= QUERY_RELATION_TO_PRIMEKG.get(
+                    str(rel.get("relation", "")).upper(), set())
+        return wanted
+
     def _get_candidate_contexts(
-        self, query: str, entities: dict, n_vector: int = 30
+        self, query: str, entities: dict, n_vector: int = 30,
+        relations: Optional[list] = None,
     ) -> list[dict]:
+        """Candidate pool from three channels, deduplicated by document text.
+
+        1. dense vector search over the whole store (same 30-NN Vanilla
+           draws its top-5 from);
+        2. relation-typed hyperedges around each linked query entity,
+           emitting the concrete facts each hyperedge contains, relations
+           the query asks about first;
+        3. n-ary PrimeKG facts in which a query entity is a member.
+        """
         import torch
         from sentence_transformers import SentenceTransformer
 
-        candidates = []
-        seen_docs = set()
+        seen_docs: set = set()
+        self._last_query_embedding = None
 
+        # -- 1. dense channel ------------------------------------------------
+        vector_cands: list[dict] = []
         try:
             device = "cuda" if torch.cuda.is_available() else "cpu"
             emb_model = (
@@ -328,150 +386,167 @@ class HCADRetriever:
             )
             # Chroma's collection uses cosine distance. Keep the query vector
             # on the same unit-normalized scale as the indexed vectors.
-            q_emb = emb_model.encode(
+            q_vec = np.asarray(emb_model.encode(
                 [query], convert_to_numpy=True, normalize_embeddings=True
-            ).tolist()
+            ), dtype=np.float32)
+            self._last_query_embedding = q_vec[0]
             results = self.collection.query(
-                query_embeddings=q_emb, n_results=n_vector
+                query_embeddings=q_vec.tolist(), n_results=n_vector
             )
             documents = (results.get("documents") or [[]])[0] or []
             metadatas = (results.get("metadatas") or [[]])[0] or []
             distances = (results.get("distances") or [[]])[0] or []
             for i, doc in enumerate(documents):
-                if doc not in seen_docs:
-                    candidates.append(
-                        {
-                            "document": doc,
-                            "metadata": metadatas[i] if i < len(metadatas) else {},
-                            "score": 1.0 - distances[i] if i < len(distances) else 0.0,
-                            "source": "vector",
-                        }
+                meta = dict(metadatas[i]) if i < len(metadatas) and metadatas[i] else {}
+                cand = {
+                    "document": doc,
+                    "metadata": meta,
+                    "score": 1.0 - distances[i] if i < len(distances) else 0.0,
+                    "source": "vector",
+                }
+                rel = meta.get("relation") or ""
+                if rel and meta.get("head_name") and meta.get("tail_name"):
+                    oriented = self._kg_candidate(
+                        meta["head_name"], meta.get("head_type", ""), rel,
+                        meta["tail_name"], meta.get("tail_type", ""),
+                        cand["score"], "vector", meta.get("display_relation"),
                     )
-                    seen_docs.add(doc)
+                    if oriented["document"] != doc:
+                        # reversed PrimeKG copy: re-rendered, so its stored
+                        # similarity no longer describes this text
+                        cand = oriented
+                    else:
+                        cand["dense_score"] = cand["score"]
+                else:
+                    cand["dense_score"] = cand["score"]
+                if cand["document"] not in seen_docs:
+                    vector_cands.append(cand)
+                    seen_docs.add(cand["document"])
         except Exception as e:
             self._handle_vector_error(e)
 
-        if self.hypergraph is not None:
-            all_entity_names = []
-            for ent_list in entities.values():
-                for ent in ent_list:
-                    all_entity_names.append(ent["text"])
+        # -- entity resolution (shared by channels 2 and 3) -------------------
+        name_to_node = getattr(self.graph, "name_to_node", {}) or {}
+        graph_nx = getattr(self.graph, "graph", self.graph)
+        if graph_nx is None or not hasattr(graph_nx, "nodes"):
+            import networkx as nx
+            graph_nx = nx.MultiDiGraph()
 
-            # Map entity names to graph node IDs using name_to_node
-            name_to_node = getattr(self.graph, "name_to_node", {})
-            graph_nx = getattr(self.graph, "graph", self.graph)
+        raw_names = [
+            ent["text"] for ent_list in (entities or {}).values() for ent in ent_list
+            if isinstance(ent, dict) and ent.get("text")
+        ]
+        # deterministic: first mention order, de-duplicated, capped at 5
+        raw_names = list(dict.fromkeys(raw_names))[:5]
+        resolved: list[tuple[str, Any]] = []   # (canonical name, node id)
+        for entity_name in raw_names:
+            matched_name = self._resolve_entity_in_graph(entity_name)
+            if not matched_name:
+                continue
+            node_id = name_to_node.get(matched_name, matched_name)
+            if node_id is not None and node_id in graph_nx:
+                resolved.append((matched_name, node_id))
 
-            # Handle case where graph or its attributes are None
-            if name_to_node is None:
-                name_to_node = {}
-            if graph_nx is None or not hasattr(graph_nx, "nodes"):
-                import networkx as nx
-                graph_nx = nx.MultiDiGraph()
+        # -- 2. hyperedge channel --------------------------------------------
+        graph_cands: list[dict] = []
+        hypergraph = self.hypergraph
+        wanted_relations = self._query_primekg_relations(relations)
 
-            # rank entities by NER salience before the
-            # arbitrary [:5] cap, so truncation is deterministic.
-            all_entity_names = list(dict.fromkeys(all_entity_names))[:5]
-            for entity_name in all_entity_names:
-                matched_name = self._resolve_entity_in_graph(entity_name)
-                if not matched_name:
-                    continue
+        def _node(n):
+            data = graph_nx.nodes[n] if n in graph_nx else {}
+            return data.get("name", str(n)), data.get("node_type", "unknown")
 
-                node_id = name_to_node.get(matched_name, matched_name)
-                if node_id is None or node_id not in graph_nx:
-                    continue
-
+        if hypergraph is not None:
+            for matched_name, node_id in resolved:
                 try:
-                    hyperedges = self.hypergraph.build_hyperedges(node_id)
-                    if hyperedges:
-                        # sort by importance BEFORE capping.
-                        hyperedges = sorted(hyperedges, key=lambda h: h["importance"], reverse=True)
-                        max_importance = max(he["importance"] for he in hyperedges) or 1.0
-                        for he in hyperedges[:5]:
-                            he_nodes = he["nodes"][:10]
-                            he_triples = self.hypergraph.get_triples_for_entities(he_nodes)
-                            norm_importance = he["importance"] / max_importance
-                            for u, relation, v in he_triples[:10]:
-                                head_name = graph_nx.nodes[u].get("name", str(u)) if u in graph_nx else str(u)
-                                tail_name = graph_nx.nodes[v].get("name", str(v)) if v in graph_nx else str(v)
-                                doc = f"{head_name} {relation.replace('_', ' ')} {tail_name}."
-                                if doc not in seen_docs:
-                                    candidates.append(
-                                        {
-                                            "document": doc,
-                                            "metadata": {
-                                                "head_name": head_name,
-                                                "tail_name": tail_name,
-                                                "relation": relation,
-                                                "display_relation": relation,
-                                                "head_type": graph_nx.nodes.get(u, {}).get("node_type", "unknown"),
-                                                "tail_type": graph_nx.nodes.get(v, {}).get("node_type", "unknown"),
-                                            },
-                                            "score": 0.5 * norm_importance,
-                                            "source": "graph_hyperedge",
-                                        }
-                                    )
-                                    seen_docs.add(doc)
+                    hyperedges = hypergraph.relation_hyperedges(node_id)
                 except Exception as e:
-                    logger.debug(f"Hyperedge expansion failed for '{matched_name}': {e}")
-                    try:
-                        triples = self.hypergraph.get_triples_for_entities([node_id])
-                        for u, relation, v in triples[:20]:
-                            head_name = graph_nx.nodes[u].get("name", str(u)) if u in graph_nx else str(u)
-                            tail_name = graph_nx.nodes[v].get("name", str(v)) if v in graph_nx else str(v)
-                            doc = f"{head_name} {relation.replace('_', ' ')} {tail_name}."
-                            if doc not in seen_docs:
-                                candidates.append(
-                                    {
-                                        "document": doc,
-                                        "metadata": {
-                                            "head_name": head_name,
-                                            "tail_name": tail_name,
-                                            "relation": relation,
-                                            "display_relation": relation,
-                                            "head_type": graph_nx.nodes.get(u, {}).get("node_type", "unknown"),
-                                            "tail_type": graph_nx.nodes.get(v, {}).get("node_type", "unknown"),
-                                        },
-                                        "score": 0.5,
-                                        "source": "graph",
-                                    }
-                                )
-                                seen_docs.add(doc)
-                    except Exception:
-                        pass
+                    logger.debug("Hyperedge expansion failed for '%s': %s", matched_name, e)
+                    continue
+                if not hyperedges:
+                    continue
+                # relations the query asks about first, then importance
+                hyperedges.sort(key=lambda h: (h["relation"] not in wanted_relations,
+                                               -h["importance"]))
+                max_importance = max(h["importance"] for h in hyperedges) or 1.0
+                emitted = 0
+                for he in hyperedges:
+                    if emitted >= GRAPH_TRIPLES_PER_ENTITY:
+                        break
+                    per_edge = 0
+                    for u, v in he["edges"]:
+                        if per_edge >= GRAPH_TRIPLES_PER_HYPEREDGE or emitted >= GRAPH_TRIPLES_PER_ENTITY:
+                            break
+                        head_name, head_type = _node(u)
+                        tail_name, tail_type = _node(v)
+                        cand = self._kg_candidate(
+                            head_name, head_type, he["relation"], tail_name, tail_type,
+                            0.5 * he["importance"] / max_importance, "graph_hyperedge",
+                        )
+                        if cand["document"] in seen_docs:
+                            continue
+                        graph_cands.append(cand)
+                        seen_docs.add(cand["document"])
+                        per_edge += 1
+                        emitted += 1
 
-        # Paper-parity (Sec. 3.4): correlation-keyword retrieval against
-        # hyperedges/facts, in addition to entity->vertex retrieval. The
-        # relation keywords extracted from the query act as X_cor.
-        if getattr(self, "_fact_index", None) is not None:
-            rel_keywords = self._relation_extractor.extract_keywords(query) \
-                if hasattr(self._relation_extractor, "extract_keywords") else []
-            anchors = set()
-            for ent_list in entities.values():
-                for ent in ent_list:
-                    if isinstance(ent, dict) and ent.get("text"):
-                        anchors.add(ent["text"].lower())
-            if rel_keywords or anchors:
-                facts = self._fact_index.retrieve(anchors, top_k=12)
-                for f in facts:
-                    doc = self._fact_index.render(f)
-                    if doc not in seen_docs:
-                        members = sorted(set(f.roles.values()))
-                        candidates.append({
-                            "document": doc,
-                            "metadata": {
-                                "head_name": members[0] if members else "",
-                                "tail_name": f.roles.get("anchor", ""),
-                                "relation": f.predicate,
-                                "display_relation": f.predicate,
-                                "fact_arity": len(f.roles),
-                                "provenance": f.source_id,
-                            },
-                            "score": 0.5 * f.confidence,
-                            "source": "nary_fact",
-                        })
-                        seen_docs.add(doc)
+        # -- 3. n-ary fact channel --------------------------------------------
+        # Paper parity (Sec. 3.4): retrieval against hyperedges/facts in
+        # addition to entity->vertex retrieval. Anchors are the linked
+        # canonical PrimeKG names (plus raw mentions), so facts are found
+        # by the same names the graph uses.
+        fact_cands: list[dict] = []
+        fact_index = getattr(self, "_fact_index", None)
+        if fact_index is not None:
+            anchors = {name.lower() for name, _ in resolved}
+            anchors |= {name.lower() for name in raw_names}
+            if anchors:
+                for f in fact_index.retrieve(anchors, top_k=NARY_FACTS_PER_QUERY):
+                    doc = fact_index.render(f, focus=anchors)
+                    if doc in seen_docs:
+                        continue
+                    heads = fact_index.displayed_heads(f, focus=anchors)
+                    fact_cands.append({
+                        "document": doc,
+                        "metadata": {
+                            "head_name": heads[0] if heads else "",
+                            "tail_name": f.roles.get("anchor", ""),
+                            "relation": f.predicate,
+                            "display_relation": f.predicate,
+                            "fact_arity": len(f.roles),
+                            "provenance": f.source_id,
+                        },
+                        "score": 0.5 * f.confidence,
+                        "source": "nary_fact",
+                    })
+                    seen_docs.add(doc)
 
-        return candidates[:60]
+        # Dense hits first, then facts, then graph triples fill the rest of
+        # the pool (graph triples are the most numerous channel).
+        candidates = vector_cands + fact_cands + graph_cands
+        return candidates[:CANDIDATE_POOL_MAX]
+
+    def _dense_similarities(self, query: str, candidates: list[dict]) -> np.ndarray:
+        """Full-text cosine(query, candidate document) for every candidate.
+
+        Vector hits reuse Chroma's similarity; graph/fact candidates (and
+        re-oriented triples) are encoded with the same embedding model,
+        served from the shared embedding cache on repeats.
+        """
+        q = getattr(self, "_last_query_embedding", None)
+        if q is None:
+            q = self._decoupler.encode_texts([query])[0]
+        q = np.asarray(q, dtype=np.float32)
+        dense = np.zeros(len(candidates), dtype=np.float32)
+        missing = [i for i, c in enumerate(candidates) if "dense_score" not in c]
+        for i, c in enumerate(candidates):
+            if "dense_score" in c:
+                dense[i] = float(c["dense_score"])
+        if missing:
+            vecs = self._decoupler.encode_texts(
+                [str(candidates[i].get("document") or "") for i in missing])
+            dense[missing] = vecs @ q
+        return dense
 
     def retrieve(
         self,
@@ -483,11 +558,28 @@ class HCADRetriever:
         self._ensure_components()
         k = k if k is not None else self.k
 
+        # Per-query diagnostics are reset up front so an early return (no
+        # candidates) can never leave the previous query's pool/sims behind
+        # for the trainer or the dev-pool harness to misread.
+        self._last_tensor_inputs = None
+        self._last_channel_sims = None
+        self._last_masked_sims = None
+        self._last_candidate_pool = None
+        self._last_phi_scores = None
+        self._last_dense_sims = None
+        self._last_dense_weight = 0.0
+
         entities = self._ner.extract_entities(query)
         relations = self._relation_extractor.extract_rules(query, entities)
+        # Query relation labels ("TREATS") rendered with the same canonical
+        # verb phrases the candidates' relation channel uses.
+        query_relations = [
+            {**r, "relation": map_query_relation(str(r.get("relation", "")))}
+            for r in (relations or []) if isinstance(r, dict)
+        ]
 
         Q, query_presence = self._decoupler.decouple(
-            query, entities=entities, relations=relations, return_presence=True
+            query, entities=entities, relations=query_relations, return_presence=True
         )
 
         all_entity_names = [
@@ -533,11 +625,16 @@ class HCADRetriever:
             weights = lam_t.detach().cpu().numpy().astype(np.float64)
             component_a = a_t.detach().cpu().numpy()
         else:
-            weights = self._transformer.compute_weights(self.graph, primary_entity)
+            if aniso_dim_weighting_enabled():
+                weights = self._transformer.compute_weights(self.graph, primary_entity)
+            else:
+                # isotropic: weighted cosine reduces to plain cosine
+                dim = int(np.asarray(Q).shape[-1])
+                weights = np.full(dim, 1.0 / dim, dtype=np.float32)
             component_a = None
 
         candidates = self._get_candidate_contexts(
-            query, entities, n_vector=n_candidates
+            query, entities, n_vector=n_candidates, relations=relations
         )
         if not candidates:
             return []
@@ -605,6 +702,24 @@ class HCADRetriever:
                 alpha=channel_weights[0], beta=channel_weights[1],
                 gamma=channel_weights[2],
             )
+
+        # Hybrid score: the decoupled channels compare short extracted
+        # fragments, so on their own they discard the full-text semantic
+        # match. Phi = w_d * dense + (1 - w_d) * Phi_struct keeps the dense
+        # ranking as a floor and lets the E/R/M channels re-rank on top.
+        phi_struct = np.asarray(phi_scores, dtype=np.float32)
+        w_d = dense_weight()
+        if w_d > 0.0:
+            dense = self._dense_similarities(query, candidates)
+        else:
+            dense = np.zeros(len(candidates), dtype=np.float32)
+        phi_scores = (w_d * dense + (1.0 - w_d) * phi_struct).astype(np.float32)
+        for ctx, s_struct, s_dense in zip(candidates, phi_struct, dense):
+            ctx["phi_struct"] = float(s_struct)
+            ctx["dense_score"] = float(s_dense)
+        self._last_dense_sims = dense
+        self._last_dense_weight = w_d
+
         # Per-channel similarities for this (query, candidate pool)
         # pair: the listwise trainer learns the query-adaptive channel
         # weights over exactly these columns. The PRE-GATE candidate

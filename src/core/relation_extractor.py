@@ -128,6 +128,19 @@ _TEMPORAL_KEYWORDS: list[str] = [
     "pre-", "peri-", "concomitantly", "simultaneously",
 ]
 
+
+def _keyword_pattern(kw: str) -> re.Pattern:
+    """Whole-word match; prefix cues ("post-") only need a leading boundary."""
+    if kw.endswith("-"):
+        return re.compile(rf"\b{re.escape(kw)}", re.IGNORECASE)
+    return re.compile(rf"\b{re.escape(kw)}\b", re.IGNORECASE)
+
+
+# Substring tests made "acute" fire on "subacute" and "upon"/"within"
+# fire inside longer words; same word-boundary rule as negation cues.
+_SEVERITY_PATTERNS = [(kw, _keyword_pattern(kw)) for kw in _SEVERITY_KEYWORDS]
+_TEMPORAL_PATTERNS = [(kw, _keyword_pattern(kw)) for kw in _TEMPORAL_KEYWORDS]
+
 # RelationExtractor
 class RelationExtractor:
     """Hybrid relation extraction with rule-based and LLM strategies.
@@ -230,17 +243,11 @@ class RelationExtractor:
             The concatenated modifier tokens, or ``"neutral"`` if none
             are found.
         """
-        text_lower = text.lower()
         modifiers: list[str] = []
 
-        # Severity
-        for kw in _SEVERITY_KEYWORDS:
-            if kw in text_lower:
-                modifiers.append(kw)
-
-        # Temporal
-        for kw in _TEMPORAL_KEYWORDS:
-            if kw in text_lower:
+        # Severity and temporal qualifiers (whole words only)
+        for kw, pat in _SEVERITY_PATTERNS + _TEMPORAL_PATTERNS:
+            if pat.search(text or ""):
                 modifiers.append(kw)
 
         # Negation

@@ -180,6 +180,16 @@ def train_tensor(
             S = torch.tensor(np.asarray(sims, dtype=np.float32))   # (N, 3)
             y = torch.tensor([1.0 if r else 0.0 for r in relevance],
                              dtype=torch.float32)                    # (N,)
+            # Train/serve parity with the hybrid score: inference ranks by
+            # Phi = w_d * dense + (1 - w_d) * Phi_struct, so the listwise
+            # loss must see the same fixed dense term (no gradient flows
+            # through it; it shifts which structural weights win).
+            dense_sims = getattr(retriever, "_last_dense_sims", None)
+            w_d = float(getattr(retriever, "_last_dense_weight", 0.0) or 0.0)
+            if dense_sims is not None and len(np.asarray(dense_sims)) == len(pool) and w_d > 0.0:
+                dense_t = torch.tensor(np.asarray(dense_sims, dtype=np.float32))
+            else:
+                dense_t, w_d = None, 0.0
 
             # 3) exact differentiable listwise loss: push the adapter's
             #    Phi = S @ a(Q) above the pool's non-gold candidates.
@@ -201,6 +211,8 @@ def train_tensor(
                 phi = S @ omega
             else:
                 phi = S @ a                               # (N,)
+            if dense_t is not None:
+                phi = w_d * dense_t + (1.0 - w_d) * phi
             logp = torch.log_softmax(phi / tau, dim=-1)
             loss = -logp[positives].mean()
 

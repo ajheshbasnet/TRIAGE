@@ -51,6 +51,57 @@ SCORE_WEIGHT_MODIFIER = 0.2
 FILTERING_K = 1.0
 MIN_PHI_SCORE = 0.10
 
+# Hybrid scoring: Phi = w_d * dense_cosine(query, document)
+#                      + (1 - w_d) * Phi_struct(E/R/M channels).
+# The structured channels compare short extracted fragments (entity names,
+# relation phrase, modifiers); on their own they discard the full-text
+# semantic match that dense retrieval ranks by. Fusing the two keeps the
+# dense signal as a floor and lets the decoupled channels re-rank on top
+# of it. HCAD_DENSE_WEIGHT=0 restores the legacy structure-only score.
+HYBRID_DENSE_WEIGHT = 0.5
+
+
+def dense_weight() -> float:
+    """Active dense-score weight w_d in [0, 1] (env HCAD_DENSE_WEIGHT)."""
+    raw = os.environ.get("HCAD_DENSE_WEIGHT")
+    if raw is None or raw == "":
+        return HYBRID_DENSE_WEIGHT
+    try:
+        return min(1.0, max(0.0, float(raw)))
+    except ValueError:
+        return HYBRID_DENSE_WEIGHT
+
+
+# Anisotropic per-dimension weighting. The topology statistics (degree,
+# edge confidence, IDF) were mapped onto three contiguous 256-dim blocks of
+# the sentence embedding, but embedding coordinates carry no such meaning,
+# PrimeKG edges have no confidence attribute (constant 1.0) and IDF used a
+# constant document frequency - the weights were effectively a fixed vector
+# that suppressed the first third of every embedding. Default OFF
+# (isotropic weighted cosine == plain cosine); HCAD_ANISO_DIM_WEIGHTING=1
+# re-enables the legacy block weighting for ablations.
+ANISO_DIM_WEIGHTING = False
+
+
+def aniso_dim_weighting_enabled() -> bool:
+    default = "1" if ANISO_DIM_WEIGHTING else "0"
+    return os.environ.get("HCAD_ANISO_DIM_WEIGHTING", default) == "1"
+
+
+# Entity linking: exact (case-insensitive) PrimeKG name match first, then
+# SapBERT nearest neighbour above this cosine threshold.
+ENTITY_LINK_THRESHOLD = 0.65
+
+# Candidate pool composition.
+CANDIDATE_POOL_MAX = 80          # total candidates scored per query
+GRAPH_TRIPLES_PER_ENTITY = 12    # hyperedge triples emitted per linked entity
+GRAPH_TRIPLES_PER_HYPEREDGE = 3  # spread over relation-typed hyperedges
+NARY_FACTS_PER_QUERY = 10
+
+# DecisionGate: at most this many evidence items may share one relation
+# type before lower-scored items of other relations/prose are preferred.
+MAX_EVIDENCE_PER_RELATION = 3
+
 # Semantic Decoupling 
 ORTHO_STRENGTH = 0.70        # soft Gram-Schmidt blend weight (eta)
 GS_EPS = 1e-8
@@ -116,6 +167,65 @@ def relation_vocab_enabled() -> bool:
     """Runtime toggle for PrimeKG relation-vocabulary mapping."""
     default = "1" if RELATION_VOCAB_MAPPING else "0"
     return os.environ.get("HCAD_RELATION_VOCAB", default) == "1"
+
+
+# Query-side relation types (RelationExtractor rule labels) rendered with
+# the same canonical verb phrases the candidates use, so the R channel
+# compares like with like ("TREATS" vs "is indicated for the treatment of").
+QUERY_RELATION_PHRASES = {
+    "TREATS": RELATION_VOCAB_MAP["indication"],
+    "INDICATED_FOR": RELATION_VOCAB_MAP["indication"],
+    "CONTRAINDICATED": RELATION_VOCAB_MAP["contraindication"],
+    "NOT_RECOMMENDED": RELATION_VOCAB_MAP["contraindication"],
+    "CAUSES": RELATION_VOCAB_MAP["drug_effect"],
+    "TARGETS": RELATION_VOCAB_MAP["drug_protein"],
+    "INHIBITS": RELATION_VOCAB_MAP["drug_protein"],
+    "ACTIVATES": RELATION_VOCAB_MAP["drug_protein"],
+    "BIOMARKER_FOR": RELATION_VOCAB_MAP["biomarker"],
+    "ASSOCIATED_WITH": RELATION_VOCAB_MAP["disease_disease"],
+}
+
+# Query relation label -> PrimeKG relations it asks about. Hyperedges of
+# these relations are expanded first for the query's entities.
+QUERY_RELATION_TO_PRIMEKG = {
+    "TREATS": {"indication", "off-label use"},
+    "INDICATED_FOR": {"indication", "off-label use"},
+    "CONTRAINDICATED": {"contraindication"},
+    "NOT_RECOMMENDED": {"contraindication"},
+    "CAUSES": {"drug_effect", "disease_phenotype_positive"},
+    "TARGETS": {"drug_protein"},
+    "INHIBITS": {"drug_protein"},
+    "ACTIVATES": {"drug_protein"},
+    "BIOMARKER_FOR": {"biomarker"},
+    "ASSOCIATED_WITH": {"disease_disease", "disease_protein"},
+}
+
+# PrimeKG stores every edge in both directions. For directed relations the
+# head must be of this node type; reversed copies are swapped back so the
+# evidence reads correctly ("Metformin is indicated for X", never
+# "X is indicated for Metformin") and duplicates collapse.
+RELATION_HEAD_TYPE = {
+    "indication": "drug",
+    "contraindication": "drug",
+    "off-label use": "drug",
+    "drug_effect": "drug",
+    "drug_protein": "drug",
+    "disease_protein": "disease",
+    "disease_phenotype_positive": "disease",
+    "disease_phenotype_negative": "disease",
+    "phenotype_protein": "effect/phenotype",
+}
+
+
+def map_query_relation(raw_relation: str) -> str:
+    """Canonical verb phrase for a query-side rule relation label."""
+    if not raw_relation:
+        return ""
+    if relation_vocab_enabled():
+        phrase = QUERY_RELATION_PHRASES.get(raw_relation.strip().upper())
+        if phrase:
+            return phrase
+    return raw_relation.replace("_", " ").lower()
 
 
 def map_relation_text(raw_relation: str) -> str:

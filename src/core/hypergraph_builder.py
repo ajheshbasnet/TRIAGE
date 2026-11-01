@@ -151,6 +151,54 @@ class HypergraphBuilder:
         )
         return hyperedges
 
+    def relation_hyperedges(self, entity_name: Any) -> list[dict]:
+        """Relation-typed hyperedges over the entity's full 1-hop neighbourhood.
+
+        One hyperedge per relation type: the centre plus EVERY neighbour it
+        shares that relation with, members ordered by the active expansion
+        rule (soft = specific neighbours first, hubs kept). Each hyperedge
+        carries the concrete edges (u, v) aligned with its members, so the
+        retriever can emit the facts the hyperedge actually contains.
+
+        build_hyperedges() groups only the 50 neighbours kept by the
+        2-hop expansion cap, so a drug's indications could be cut in favour
+        of rarer protein targets; the retriever previously also read
+        triples from the centre's first CSV edges for every hyperedge,
+        ignoring both the grouping and the expansion rule.
+
+        Returns hyperedges with keys: relation, nodes ([centre] + members),
+        edges (list of (u, v) aligned with members), importance.
+        """
+        node_id = self._resolve_entity(entity_name)
+        if node_id not in self.graph:
+            return []
+
+        groups: dict[str, dict[Any, tuple]] = {}
+        for u, v, data in self.graph.out_edges(node_id, data=True):
+            if v != node_id:
+                groups.setdefault(data.get("relation", "unknown"), {}).setdefault(v, (u, v))
+        if hasattr(self.graph, "in_edges"):
+            for u, v, data in self.graph.in_edges(node_id, data=True):
+                if u != node_id:
+                    groups.setdefault(data.get("relation", "unknown"), {}).setdefault(u, (u, v))
+
+        hyperedges = []
+        for relation, neighbour_edges in groups.items():
+            members = self._ordered_neighbors(set(neighbour_edges))
+            if not members:
+                continue
+            nodes = [node_id] + members
+            hyperedges.append({
+                "relation": relation,
+                "nodes": nodes,
+                "edges": [neighbour_edges[m] for m in members],
+                "importance": self.compute_hyperedge_importance(
+                    {"nodes": nodes[: 1 + MAX_NEIGHBORS_PER_HOP]}
+                ),
+            })
+        hyperedges.sort(key=lambda h: h["importance"], reverse=True)
+        return hyperedges
+
     # Incidence Matrix
 
     def get_incidence_matrix(self, hyperedges: list[dict]) -> np.ndarray:
