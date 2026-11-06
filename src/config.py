@@ -327,16 +327,18 @@ LLM_HF_MODEL = "meta-llama/Llama-3.1-8B-Instruct"
 JUDGE_HF_MODEL = "lingshu-medical-mllm/Lingshu-7B"
 # Base-paper parity : 72B-class judge as in the paper's
 # protocol. Fits A100 80GB locally (Q4). Override to qwen3:14b for small GPUs.
+JUDGE_HF_MODEL = "google/gemma-2-9b-it"
+
 JUDGE_OLLAMA_MODEL = os.getenv(
     "JUDGE_OLLAMA_MODEL",
-    "hf.co/mradermacher/Lingshu-7B-GGUF:Q4_K_M"
+    "gemma2:9b"
 )
+
 NVIDIA_API_KEY = os.getenv("NVIDIA_API_KEY", "")
 NVIDIA_BASE_URL = os.getenv("NVIDIA_BASE_URL", "https://integrate.api.nvidia.com/v1")
 # Text-optimized NIM models (vision-instruct variants underperform on clinical
 # prose and waste tokens on the image tower). Override via env if needed.
 LLM_NVIDIA_MODEL = os.getenv("LLM_NVIDIA_MODEL", "meta/llama-3.1-8b-instruct")
-JUDGE_NVIDIA_MODEL = os.getenv("JUDGE_NVIDIA_MODEL", "qwen/qwen2.5-72b-instruct")
 HF_TOKEN = os.getenv("HF_TOKEN", "")  # Hub downloads (SapBERT/S-PubMedBert) still need this
 WANDB_PROJECT = os.getenv("WANDB_PROJECT", "hcad-rag")
 WANDB_ENTITY = os.getenv("WANDB_ENTITY") or None
